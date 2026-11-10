@@ -28,20 +28,35 @@ TRY_CAST TRY_CONVERT ISDATE ISNUMERIC NEWID LEFT RIGHT
 const CLAUSE_START = new Set(['SELECT', 'FROM', 'WHERE', 'HAVING', 'LIMIT', 'OFFSET', 'UNION', 'INTERSECT', 'EXCEPT',
   'VALUES', 'SET', 'INSERT', 'UPDATE', 'DELETE', 'MERGE', 'WITH', 'TRUNCATE', 'FETCH']);
 
+// Tipos de datos que admiten paréntesis: VARCHAR(100), DECIMAL(10,2), etc.
+const TYPE_PAREN = new Set(`
+INT INTEGER BIGINT SMALLINT TINYINT BIT BOOLEAN BOOL SERIAL BIGSERIAL VARCHAR NVARCHAR CHAR NCHAR TEXT NTEXT DATE DATETIME
+DATETIME2 SMALLDATETIME TIME TIMESTAMP DECIMAL NUMERIC FLOAT REAL DOUBLE MONEY SMALLMONEY XML JSON JSONB UUID BLOB CLOB IMAGE
+UNIQUEIDENTIFIER VARBINARY BINARY ROWVERSION
+`.split(/\s+/).filter(Boolean));
+
 /* ------------------------------ Léxico ------------------------------ */
 
 function tokenize(sql, keepWs) {
   const tokens = [];
   const re = /(--[^\n]*)|(\/\*[\s\S]*?\*\/)|('(?:[^']|'')*'|"(?:[^"]|"")*"|`[^`]*`|N'(?:[^']|'')*')|(\d+(?:\.\d+)?(?:[eE][+-]?\d+)?|\.\d+(?:[eE][+-]?\d+)?)|(\[[^\]]*\]|[A-Za-z_@#][\w@$#]*)|(<=|>=|<>|!=|==|\|\||::|->>|->|#>>|#>|:=|[-+*/%=<>!~&|^?:])|([(),;.])|(\s+)|(.)/g;
   let m;
+  let pendingNl = 0;
+  function push(type, value) {
+    tokens.push({ type, value, nl: pendingNl });
+    pendingNl = 0;
+  }
   while ((m = re.exec(sql))) {
-    if (m[1] || m[2]) tokens.push({ type: 'comment', value: m[0] });
-    else if (m[3]) tokens.push({ type: 'string', value: m[0] });
-    else if (m[4]) tokens.push({ type: 'number', value: m[0] });
-    else if (m[5]) tokens.push({ type: KEYWORDS.has(m[5].toUpperCase()) ? 'keyword' : 'identifier', value: m[5] });
-    else if (m[6]) tokens.push({ type: 'operator', value: m[0] });
-    else if (m[7]) tokens.push({ type: 'punct', value: m[0] });
-    else if (m[8] && keepWs) tokens.push({ type: 'ws', value: m[0] });
+    if (m[1] || m[2]) push('comment', m[0]);
+    else if (m[3]) push('string', m[0]);
+    else if (m[4]) push('number', m[0]);
+    else if (m[5]) push(KEYWORDS.has(m[5].toUpperCase()) ? 'keyword' : 'identifier', m[5]);
+    else if (m[6]) push('operator', m[0]);
+    else if (m[7]) push('punct', m[0]);
+    else if (m[8]) {
+      pendingNl += (m[0].match(/\n/g) || []).length;
+      if (keepWs) tokens.push({ type: 'ws', value: m[0] });
+    }
   }
   return tokens;
 }
@@ -81,6 +96,12 @@ function formatSql(sql, opts) {
     const prev2 = tokens[i - 2];
     const next = tokens[i + 1];
 
+    // Preservar líneas en blanco del SQL original (separadores de secciones)
+    if (t.nl >= 2) {
+      if (cur.trim()) newline();
+      if (lines.length && lines[lines.length - 1] !== '') lines.push('');
+    }
+
     if (t.type === 'comment') {
       if (!opts.preserveComments) continue;
       if (cur.trim()) newline();
@@ -101,11 +122,17 @@ function formatSql(sql, opts) {
         const isSubquery = next && next.type === 'keyword' && /^(SELECT|WITH)$/i.test(next.value);
         const isInList = !isSubquery && opts.expandInLists && prev && prev.type === 'keyword' && prev.value.toUpperCase() === 'IN';
         const afterClauseKw = prev && prev.type === 'identifier' && prev2 && prev2.type === 'keyword'
-          && /^(INTO|FROM|JOIN|UPDATE|TABLE|APPLY|TRUNCATE)$/i.test(prev2.value);
-        const fnCall = !afterClauseKw && prev && (prev.type === 'identifier'
-          || (prev.type === 'keyword' && FUNCTIONS.has(prev.value.toUpperCase())));
+          && /^(INSERT|INTO|FROM|JOIN|UPDATE|TABLE|APPLY|TRUNCATE)$/i.test(prev2.value);
+        // CREATE TABLE nombre (...): retroceder sobre la cadena identificador(.identificador)
+        let j = i - 1;
+        while (j >= 0 && (tokens[j].type === 'identifier' || (tokens[j].type === 'punct' && tokens[j].value === '.'))) j--;
+        const isDdl = !isSubquery && opts.expandCommaLists && prev && prev.type === 'identifier'
+          && tokens[j] && tokens[j].type === 'keyword' && tokens[j].value.toUpperCase() === 'TABLE';
+        const fnCall = !afterClauseKw && !isDdl && prev && (prev.type === 'identifier'
+          || (prev.type === 'keyword' && (FUNCTIONS.has(prev.value.toUpperCase()) || TYPE_PAREN.has(prev.value.toUpperCase()))));
         append('(', !fnCall);
         if (isSubquery) { parenStack.push('block'); indentLevel++; newline(); }
+        else if (isDdl) { parenStack.push('ddl'); indentLevel++; newline(); }
         else if (isInList) { parenStack.push('inlist'); indentLevel++; newline(); }
         else { parenStack.push('inline'); noSpaceNext = true; }
         continue;
@@ -120,7 +147,7 @@ function formatSql(sql, opts) {
         const top = parenStack[parenStack.length - 1];
         const breakIt = top === 'inlist' || (opts.expandCommaLists && !parenStack.includes('inline'));
         if (breakIt) {
-          const extra = top === 'inlist' ? 0 : 1;
+          const extra = (top === 'inlist' || top === 'ddl') ? 0 : 1;
           if (opts.trailingCommas) { append(',', false); newline(extra); }
           else { newline(extra); append(',', false); }
         } else {
@@ -150,6 +177,11 @@ function formatSql(sql, opts) {
         i++;
         continue;
       }
+      if (w === 'WITH' && next && next.type === 'punct' && next.value === '(') {
+        // Table hint: WITH (NOLOCK) — no es un CTE
+        append(kwc(t.value));
+        continue;
+      }
       if (CLAUSE_START.has(w)) {
         if (!parenStack.includes('inline') && cur.trim()) newline();
         append(kwc(t.value), false);
@@ -165,9 +197,11 @@ function formatSql(sql, opts) {
         append(kwc(t.value));
         continue;
       }
-      if (/^(LEFT|RIGHT|FULL|INNER|CROSS|OUTER)$/.test(w)) {
+      if (/^(LEFT|RIGHT|FULL|INNER|CROSS|OUTER|LOOP|MERGE|HASH)$/.test(w)) {
         let j = i + 1;
         if (w !== 'OUTER' && tokens[j] && tokens[j].type === 'keyword' && tokens[j].value.toUpperCase() === 'OUTER') j++;
+        if (!/^(OUTER|LOOP|MERGE|HASH)$/.test(w) && tokens[j] && tokens[j].type === 'keyword'
+          && /^(LOOP|MERGE|HASH)$/.test(tokens[j].value.toUpperCase())) j++;
         if (tokens[j] && tokens[j].type === 'keyword' && /^(JOIN|APPLY)$/.test(tokens[j].value.toUpperCase())) {
           if (cur.trim()) newline();
           append(kwc(t.value), false);
@@ -177,7 +211,7 @@ function formatSql(sql, opts) {
         continue;
       }
       if (w === 'JOIN' || w === 'APPLY') {
-        const prevMod = prev && prev.type === 'keyword' && /^(LEFT|RIGHT|FULL|INNER|CROSS|OUTER)$/i.test(prev.value);
+        const prevMod = prev && prev.type === 'keyword' && /^(LEFT|RIGHT|FULL|INNER|CROSS|OUTER|LOOP|MERGE|HASH)$/i.test(prev.value);
         if (!prevMod && cur.trim()) newline();
         append(kwc(t.value));
         continue;
@@ -199,10 +233,22 @@ function formatSql(sql, opts) {
         continue;
       }
       if (w === 'BETWEEN') { append(kwc(t.value)); betweenPending = true; continue; }
-      if (w === 'CASE' && opts.expandCase) {
+      if (w === 'IF' || w === 'WHILE') {
+        const afterElse = prev && prev.type === 'keyword' && prev.value.toUpperCase() === 'ELSE';
+        if (!afterElse && !parenStack.includes('inline') && cur.trim()) newline();
+        append(kwc(t.value));
+        continue;
+      }
+      if (w === 'BEGIN') {
+        append(kwc(t.value));
+        indentLevel++;
+        newline();
+        continue;
+      }
+      if (w === 'CASE') {
         append(kwc(t.value));
         caseStack.push(true);
-        indentLevel++;
+        if (opts.expandCase) indentLevel++;
         continue;
       }
       if (w === 'WHEN' && opts.expandCase && caseStack.length) {
@@ -220,6 +266,28 @@ function formatSql(sql, opts) {
         indentLevel = Math.max(0, indentLevel - 1);
         newline(1);
         append(kwc(t.value), false);
+        continue;
+      }
+      if (w === 'END' && caseStack.length) {
+        // END de un CASE sin expansión
+        caseStack.pop();
+        append(kwc(t.value));
+        continue;
+      }
+      if (w === 'END') {
+        // END de un bloque BEGIN ... END
+        indentLevel = Math.max(0, indentLevel - 1);
+        if (cur.trim()) newline();
+        else cur = ind.repeat(indentLevel);
+        append(kwc(t.value), false);
+        continue;
+      }
+      if (w === 'ELSE' && !caseStack.length) {
+        // ELSE de un bloque IF ... ELSE
+        if (cur.trim()) newline();
+        else cur = ind.repeat(indentLevel);
+        append(kwc(t.value), false);
+        if (!(next && next.type === 'keyword' && /^(BEGIN|IF)$/i.test(next.value))) newline(1);
         continue;
       }
       append(kwc(t.value));
